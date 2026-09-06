@@ -30,9 +30,8 @@ def _build_grammar_mapping(
             # Grammar masks follow the scheduled layout even when adaptive
             # verification compacts the actual CPU logit offsets to bonus-only.
             num_positions = int(num_draft_tokens_per_req[req_idx]) + num_bonus_tokens
-        mapping.extend(
-            req_idx * mask_stride + position for position in range(num_positions)
-        )
+        start = req_idx * mask_stride
+        mapping.extend(range(start, start + num_positions))
     return mapping
 
 
