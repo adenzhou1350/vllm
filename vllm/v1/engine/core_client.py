@@ -2,12 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
-import queue
 import sys
 import uuid
 import weakref
 from abc import ABC, abstractmethod
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -886,69 +885,31 @@ class SyncMPClient(MPClient):
         )
 
         self.is_dp = self.vllm_config.parallel_config.data_parallel_size > 1
-        self.outputs_queue = queue.Queue[EngineCoreOutputs | Exception]()
+        self.pending_outputs: deque[EngineCoreOutputs] = deque()
 
-        # Ensure that the outputs socket processing thread does not have
-        # a ref to the client which prevents gc.
-        ctx = self.ctx
-        out_socket = self.resources.output_socket
-        decoder = self.decoder
-        utility_results = self.utility_results
-        outputs_queue = self.outputs_queue
+    def _recv_output(self) -> EngineCoreOutputs:
+        """Receive and decode one output on the caller thread.
 
-        shutdown_path = get_open_zmq_inproc_path()
-        resources = self.resources
-        resources.shutdown_path = shutdown_path
-
-        def process_outputs_socket():
-            assert isinstance(out_socket, zmq.Socket)
-            shutdown_socket = ctx.socket(zmq.PAIR)
-            try:
-                shutdown_socket.bind(shutdown_path)
-                poller = zmq.Poller()
-                poller.register(shutdown_socket, zmq.POLLIN)
-                poller.register(out_socket, zmq.POLLIN)
-                while True:
-                    socks = poller.poll()
-                    if not socks:
-                        continue
-                    if len(socks) == 2 or socks[0][0] == shutdown_socket:
-                        # shutdown signal, exit thread.
-                        break
-
-                    frames = out_socket.recv_multipart(copy=False)
-                    resources.validate_alive(frames)
-                    outputs: EngineCoreOutputs = decoder.decode(frames)
-                    if outputs.utility_output:
-                        _process_utility_output(outputs.utility_output, utility_results)
-                    else:
-                        outputs_queue.put_nowait(outputs)
-            except Exception as e:
-                outputs_queue.put_nowait(e)
-            finally:
-                # Close sockets.
-                shutdown_socket.close(linger=0)
-                out_socket.close(linger=0)
-
-        # Process outputs from engine in separate thread.
-        self.output_queue_thread = Thread(
-            target=process_outputs_socket,
-            name="EngineCoreOutputQueueThread",
-            daemon=True,
-        )
-        self.output_queue_thread.start()
-
-        # The thread takes on responsibility for closing the socket.
-        self.resources.output_socket = None
+        ``LLMEngine`` is synchronous, so routing its outputs through a second
+        thread and a Python queue adds a wake-up to every engine step without
+        enabling overlap. Keep the ZMQ socket on the caller thread instead.
+        """
+        output_socket = self.resources.output_socket
+        assert isinstance(output_socket, zmq.Socket)
+        frames = output_socket.recv_multipart(copy=False)
+        self.resources.validate_alive(frames)
+        return self.decoder.decode(frames)
 
     def get_output(self) -> EngineCoreOutputs:
-        # If an exception arises in process_outputs_socket task,
-        # it is forwarded to the outputs_queue so we can raise it
-        # from this (run_output_handler) task to shut down the server.
-        outputs = self.outputs_queue.get()
-
-        if isinstance(outputs, Exception):
-            raise self._format_exception(outputs) from None
+        while True:
+            outputs = (
+                self.pending_outputs.popleft()
+                if self.pending_outputs
+                else self._recv_output()
+            )
+            if outputs.utility_output is None:
+                break
+            _process_utility_output(outputs.utility_output, self.utility_results)
         if outputs.wave_complete is not None:
             self.engines_running = False
         return outputs
@@ -968,6 +929,12 @@ class SyncMPClient(MPClient):
         self.utility_results[call_id] = future
         self._send_input(EngineCoreRequestType.UTILITY, (0, call_id, method, args))
 
+        while not future.done():
+            outputs = self._recv_output()
+            if outputs.utility_output is not None:
+                _process_utility_output(outputs.utility_output, self.utility_results)
+            else:
+                self.pending_outputs.append(outputs)
         return future.result()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
