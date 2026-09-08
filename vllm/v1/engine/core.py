@@ -33,6 +33,7 @@ from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import MultiModalCacheMissError
+from vllm.sampling_params import RequestOutputKind
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -1109,6 +1110,22 @@ class EngineCoreProc(EngineCore):
                 internal_dp_balancing,
             )
 
+            # FINAL_ONLY requests do not consume intermediate outputs. When
+            # stream_interval > 1, retain simple token-only outputs in the
+            # EngineCore process and cross the process boundary once per
+            # interval instead of once per decode step. Keep this deliberately
+            # narrow: frontend stop strings, metrics, logprobs, connectors,
+            # resumable requests, and distributed engines need per-step data.
+            self._allow_final_only_output_coalescing = (
+                local_client
+                and not log_stats
+                and vllm_config.parallel_config.data_parallel_size == 1
+            )
+            self._output_coalesce_intervals: dict[str, int] = {}
+            self._pending_coalesced_outputs: dict[
+                str, tuple[int, EngineCoreOutput, int, int, float]
+            ] = {}
+
             # Initialize fault tolerance settings.
             self.enable_fault_tolerance = (
                 vllm_config.parallel_config.enable_fault_tolerance
@@ -1483,7 +1500,7 @@ class EngineCoreProc(EngineCore):
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
-            self.output_queue.put_nowait(output)
+            self._enqueue_or_coalesce_output(*output)
         # Post-step hook.
         self.post_step(model_executed)
 
@@ -1494,6 +1511,126 @@ class EngineCoreProc(EngineCore):
             time.sleep(0.001)
 
         return model_executed
+
+    @staticmethod
+    def _is_simple_token_output(output: EngineCoreOutput) -> bool:
+        """Whether an output can be merged without losing side-channel data."""
+        return (
+            output.new_logprobs is None
+            and output.new_prompt_logprobs_tensors is None
+            and output.pooling_output is None
+            and output.kv_transfer_params is None
+            and output.ec_transfer_params is None
+            and output.routed_experts is None
+            and output.mm_cache_miss_hashes is None
+            and output.new_sampling_mask is None
+            and output.spec_decode_metrics is None
+        )
+
+    @staticmethod
+    def _merge_token_output(
+        pending: EngineCoreOutput, current: EngineCoreOutput
+    ) -> None:
+        pending.new_token_ids.extend(current.new_token_ids)
+        pending.finish_reason = current.finish_reason
+        pending.stop_reason = current.stop_reason
+        pending.num_nans_in_logits += current.num_nans_in_logits
+        if current.events:
+            if pending.events is None:
+                pending.events = []
+            pending.events.extend(current.events)
+        if pending.trace_headers is None:
+            pending.trace_headers = current.trace_headers
+        if pending.prefill_stats is None:
+            pending.prefill_stats = current.prefill_stats
+
+    def _flush_coalesced_outputs(self, request_ids: Sequence[str]) -> None:
+        by_client: dict[int, list[tuple[EngineCoreOutput, int, float]]] = defaultdict(
+            list
+        )
+        for request_id in request_ids:
+            state = self._pending_coalesced_outputs.pop(request_id, None)
+            if state is None:
+                continue
+            client_index, output, _, engine_index, timestamp = state
+            by_client[client_index].append((output, engine_index, timestamp))
+
+        for client_index, states in by_client.items():
+            outputs = [state[0] for state in states]
+            finished = {output.request_id for output in outputs if output.finished}
+            self.output_queue.put_nowait(
+                (
+                    client_index,
+                    EngineCoreOutputs(
+                        engine_index=states[-1][1],
+                        outputs=outputs,
+                        timestamp=states[-1][2],
+                        finished_requests=finished or None,
+                    ),
+                )
+            )
+
+    def _enqueue_or_coalesce_output(
+        self, client_index: int, outputs: EngineCoreOutputs
+    ) -> None:
+        # Outer per-step metadata is not mergeable. Fall back to the original
+        # path and flush older token data first to preserve ordering.
+        if (
+            outputs.scheduler_stats is not None
+            or outputs.utility_output is not None
+            or outputs.wave_complete is not None
+            or outputs.start_wave is not None
+            or any(
+                not self._is_simple_token_output(output)
+                or output.request_id not in self._output_coalesce_intervals
+                for output in outputs.outputs
+            )
+        ):
+            self._flush_coalesced_outputs(
+                [
+                    request_id
+                    for request_id, state in self._pending_coalesced_outputs.items()
+                    if state[0] == client_index
+                ]
+            )
+            self.output_queue.put_nowait((client_index, outputs))
+            for output in outputs.outputs:
+                if output.finished or not self._is_simple_token_output(output):
+                    self._output_coalesce_intervals.pop(output.request_id, None)
+            return
+
+        ready: list[str] = []
+        for output in outputs.outputs:
+            request_id = output.request_id
+            state = self._pending_coalesced_outputs.get(request_id)
+            if state is None:
+                count = 1
+                self._pending_coalesced_outputs[request_id] = (
+                    client_index,
+                    output,
+                    count,
+                    outputs.engine_index,
+                    outputs.timestamp,
+                )
+            else:
+                pending_client, pending, count, _, _ = state
+                assert pending_client == client_index
+                self._merge_token_output(pending, output)
+                count += 1
+                self._pending_coalesced_outputs[request_id] = (
+                    client_index,
+                    pending,
+                    count,
+                    outputs.engine_index,
+                    outputs.timestamp,
+                )
+
+            if output.finished or count >= self._output_coalesce_intervals[request_id]:
+                ready.append(request_id)
+            if output.finished:
+                self._output_coalesce_intervals.pop(request_id, None)
+
+        self._flush_coalesced_outputs(ready)
 
     def _notify_idle_state_callbacks(self) -> None:
         while self._idle_state_callbacks:
@@ -1559,10 +1696,37 @@ class EngineCoreProc(EngineCore):
             req, request_wave = request
             if self._reject_add_in_shutdown(req):
                 return
+            sampling_params = req.sampling_params
+            stream_interval = (
+                max(
+                    sampling_params.stream_interval or 1,
+                    self.vllm_config.scheduler_config.stream_interval,
+                )
+                if sampling_params is not None
+                else 1
+            )
+            if (
+                self._allow_final_only_output_coalescing
+                and sampling_params is not None
+                and sampling_params.output_kind == RequestOutputKind.FINAL_ONLY
+                and stream_interval > 1
+                and sampling_params.stop is None
+                and sampling_params.logprobs is None
+                and sampling_params.prompt_logprobs is None
+                and sampling_params.logprob_token_ids is None
+                and sampling_params.structured_outputs is None
+                and sampling_params.repetition_detection is None
+                and not req.resumable
+            ):
+                self._output_coalesce_intervals[req.request_id] = stream_interval
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
+            self._flush_coalesced_outputs(request)
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
+            self._flush_coalesced_outputs(
+                list(self._pending_coalesced_outputs.keys())
+            )
             client_idx, call_id, method_name, args = request
             if self._reject_utility_in_shutdown(client_idx, call_id, method_name):
                 return
