@@ -1868,7 +1868,7 @@ class EngineCoreProc(EngineCore):
                 tracker = self._send_msg_tracking_payload(
                     sockets[client_index], buffers
                 )
-                if not tracker.done:
+                if tracker is not None and not tracker.done:
                     pending.appendleft((tracker, buffer))
                 elif len(reuse_buffers) < max_reuse_bufs:
                     # Limit the number of buffers to reuse.
@@ -1911,16 +1911,23 @@ class EngineCoreProc(EngineCore):
     @staticmethod
     def _send_msg_tracking_payload(
         socket: zmq.Socket, buffers: Sequence[bytestr]
-    ) -> zmq.MessageTracker:
+    ) -> zmq.MessageTracker | None:
         """Send `buffers` as a zero-copy multipart message, returning a tracker
         for the *first* frame.
 
         Used instead of `Socket.send_multipart()` because we reuse the buffer
         passed to `MsgpackEncoder.encode_into()`: `send_multipart()` returns a
-        tracker for the last frame only.
+        tracker for the last frame only. Small first frames are copied so their
+        reusable buffer can be reclaimed immediately; large frames stay
+        zero-copy and return a tracker.
         """
         more_flag = zmq.SNDMORE if len(buffers) > 1 else 0
-        tracker = socket.send(buffers[0], more_flag, copy=False, track=True)
+        first_buffer = buffers[0]
+        if len(first_buffer) <= socket.copy_threshold:
+            socket.send(first_buffer, more_flag)
+            tracker = None
+        else:
+            tracker = socket.send(first_buffer, more_flag, copy=False, track=True)
         if more_flag:
             socket.send_multipart(buffers[1:], copy=False)
         return tracker
