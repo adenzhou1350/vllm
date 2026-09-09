@@ -9,7 +9,7 @@ validated by this test module.
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pytest
 import torch
@@ -24,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     MooncakeXferMetadata,
     SendBlockMeta,
     TransferRegion,
+    group_concurrent_contiguous,
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -348,7 +349,7 @@ async def test_build_transfer_params_uses_non_overlapping_physical_pages():
         "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
         "mooncake_connector.group_concurrent_contiguous",
         side_effect=split_contiguous_blocks,
-    ):
+    ) as group_spy:
         (
             src_ptrs,
             dst_ptrs,
@@ -362,6 +363,10 @@ async def test_build_transfer_params_uses_non_overlapping_physical_pages():
             remote_regions,
         )
 
+    group_spy.assert_called_once_with(
+        list(range(local_logical_block * ratio, (local_logical_block + 1) * ratio)),
+        list(range(remote_logical_block * ratio, (remote_logical_block + 1) * ratio)),
+    )
     expected_src_ptrs = [
         fa_cache.data_ptr()
         + (local_logical_block * ratio + offset) * physical_page_bytes
@@ -526,9 +531,14 @@ def test_hybrid_gdn_transfer_params_preserve_group_identity(monkeypatch):
             ),
         ]
 
-        src_ptrs, dst_ptrs, lengths, err_reqs, err_msg = asyncio.run(
-            build_transfer_params()
-        )
+        with patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.group_concurrent_contiguous",
+            wraps=group_concurrent_contiguous,
+        ) as group_spy:
+            src_ptrs, dst_ptrs, lengths, err_reqs, err_msg = asyncio.run(
+                build_transfer_params()
+            )
 
         assert err_reqs == []
         assert err_msg is None
@@ -541,6 +551,10 @@ def test_hybrid_gdn_transfer_params_preserve_group_identity(monkeypatch):
             0x2000 + 30 * block_len,
         ]
         assert lengths == [block_len, 2 * block_len]
+        assert group_spy.call_args_list == [
+            call([4], [7]),
+            call([10, 11], [30, 31]),
+        ]
 
         worker.shutdown()
         worker.shutdown = noop_shutdown
