@@ -5,7 +5,7 @@ import asyncio
 import contextlib
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 import torch
@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     TransferRegion,
     _align_transfer_regions,
     get_mooncake_bootstrap_addr,
+    group_concurrent_contiguous,
     should_launch_bootstrap_server,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
@@ -65,6 +66,77 @@ def _make_test_kv_cache_config() -> KVCacheConfig:
             )
         ],
     )
+
+
+def _make_transfer_params_worker() -> MooncakeConnectorWorker:
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.tp_rank = 0
+    worker.tp_size = 1
+    worker.kv_cache_config = _make_test_kv_cache_config()
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker.transfer_topo = SimpleNamespace(local_replicates_kv_cache=False)
+    return worker
+
+
+def _make_transfer_params_case(
+    *,
+    request_count: int = 1,
+    local_block_ids: tuple[int, ...] = (10, 11),
+    remote_block_ids: tuple[int, ...] = (20, 21),
+):
+    worker = _make_transfer_params_worker()
+    block_len = 0x100
+    local_regions = [
+        TransferRegion(
+            layer_name=f"model.layers.{layer_index}.self_attn",
+            layer_index=layer_index,
+            base_addr=base_addr,
+            block_len=block_len,
+            kv_block_len=block_len,
+            group_index=0,
+        )
+        for layer_index, base_addr in [(0, 0x1000), (1, 0x2000)]
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name=f"model.layers.{layer_index}.self_attn",
+            layer_index=layer_index,
+            base_addr=base_addr,
+            block_len=block_len,
+            kv_block_len=block_len,
+            group_index=0,
+        )
+        for layer_index, base_addr in [(0, 0xA000), (1, 0xB000)]
+    ]
+    ready_reqs = []
+    req_blocks = {}
+    for request_index in range(request_count):
+        transfer_id = f"xfer-group-cache-{request_index}"
+        request_id = f"d-group-cache-{request_index}"
+        ready_reqs.append(
+            (
+                request_id,
+                SendBlockMeta(
+                    p_req_id=f"p-group-cache-{request_index}",
+                    transfer_id=transfer_id,
+                    local_block_ids=[list(local_block_ids)],
+                    ready=asyncio.Event(),
+                ),
+            )
+        )
+        req_blocks[request_id] = (transfer_id, [list(remote_block_ids)])
+    xfer_meta = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=1,
+        remote_tp_rank=0,
+        req_blocks=req_blocks,
+        kv_caches_base_addr=[],
+        block_lens=[],
+        kv_block_lens=[],
+    )
+    return worker, ready_reqs, xfer_meta, local_regions, remote_regions
 
 
 class FakeMooncakeWrapper:
@@ -268,6 +340,100 @@ async def test_build_transfer_params_separates_prefill_pp_layers():
         assert src_ptrs == expected_by_pp_rank[pp_rank]["src_ptrs"]
         assert dst_ptrs == expected_by_pp_rank[pp_rank]["dst_ptrs"]
         assert lengths == [2 * block_len, 2 * block_len]
+
+
+@pytest.mark.asyncio
+async def test_build_transfer_params_reuses_grouping_per_request():
+    worker, ready_reqs, xfer_meta, local_regions, remote_regions = (
+        _make_transfer_params_case(
+            request_count=2,
+            local_block_ids=(8, 9, 10, 11),
+        )
+    )
+    block_len = 0x100
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+        "mooncake_connector.group_concurrent_contiguous",
+        wraps=group_concurrent_contiguous,
+    ) as group_spy:
+        result = await worker._build_transfer_params(
+            ready_reqs,
+            xfer_meta,
+            local_regions,
+            remote_regions,
+        )
+
+    assert result == (
+        [0x1000 + 10 * block_len, 0x2000 + 10 * block_len] * 2,
+        [0xA000 + 20 * block_len, 0xB000 + 20 * block_len] * 2,
+        [2 * block_len] * 4,
+        [],
+        None,
+    )
+    assert group_spy.call_args_list == [
+        call([10, 11], [20, 21]),
+        call([10, 11], [20, 21]),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("plans", "expected_events", "expected_result"),
+    [
+        pytest.param(
+            [(False, 0, 0, 0x100), (True, 0, 0, 0x100)],
+            ["plan", "plan", "group"],
+            ([0x2000 + 10 * 0x100], [0xB000 + 20 * 0x100], [2 * 0x100], [], None),
+            id="false-then-true",
+        ),
+        pytest.param(
+            [(False, 0, 0, 0x100), (False, 0, 0, 0x100)],
+            ["plan", "plan"],
+            ([], [], [], [], None),
+            id="all-false",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_build_transfer_params_groups_only_for_transferring_regions(
+    plans,
+    expected_events,
+    expected_result,
+):
+    worker, ready_reqs, xfer_meta, local_regions, remote_regions = (
+        _make_transfer_params_case()
+    )
+    events = []
+    remaining_plans = iter(plans)
+
+    def sender_plan(**kwargs):
+        events.append("plan")
+        return next(remaining_plans)
+
+    def group_blocks(src_ids, dst_ids):
+        events.append("group")
+        return group_concurrent_contiguous(src_ids, dst_ids)
+
+    with (
+        patch.object(worker, "_get_sender_transfer_plan", side_effect=sender_plan),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.group_concurrent_contiguous",
+            side_effect=group_blocks,
+        ) as group_spy,
+    ):
+        result = await worker._build_transfer_params(
+            ready_reqs,
+            xfer_meta,
+            local_regions,
+            remote_regions,
+        )
+
+    assert events == expected_events
+    assert group_spy.call_count == expected_events.count("group")
+    if group_spy.called:
+        group_spy.assert_called_once_with([10, 11], [20, 21])
+    assert result == expected_result
 
 
 @pytest.mark.asyncio
@@ -1402,3 +1568,5 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
 
         prefill_worker.sender_loop = origin_sender_loop
         prefill_worker.shutdown()
+        prefill_worker.shutdown = MagicMock()
+        prefill_connector.connector_worker = None
