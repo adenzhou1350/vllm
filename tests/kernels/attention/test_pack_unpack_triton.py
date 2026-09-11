@@ -82,17 +82,15 @@ def test_pack_seq_default_negative_inf_padding_fp8():
     dtype = torch.float8_e4m3fn
     # B = 2
     N, H, D = 20, 8, 16
-    lengths = torch.tensor([10, 10], device=device)
+    lengths = torch.tensor([12, 8], device=device)
 
     x = torch.randn(N, H, D, dtype=torch.float32, device=device) * 0.1
     x = x.to(dtype=dtype)
     result = pack_seq_triton(x, lengths)
 
     # Check that padding is large negative values (fp8 representation of -inf)
-    padded_data = result[:, 10:].to(torch.float32)
-    assert torch.all(
-        padded_data < -100
-    )  # fp8 -inf is represented as large negative number
+    padded_data = result[1, 8:].to(torch.float32)
+    assert torch.all(padded_data == -448)
 
 
 def test_pack_seq_edge_cases_fp8():

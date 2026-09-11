@@ -1298,7 +1298,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # Only the DeepGEMM paged-MQA path consumes scheduler metadata.
+            # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
             if current_platform.is_cuda() and is_deep_gemm_supported():
                 metadata = get_paged_mqa_logits_metadata(

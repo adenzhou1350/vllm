@@ -19,9 +19,9 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
-from vllm.v1.attention.ops.fp8e4nv import (
-    FP8E4NV_EXTERN_LIBS,
-    convert_from_fp8e4m3,
+from vllm.v1.attention.ops.fp8_sm80 import (
+    _decode_fp8_lut,
+    get_e4m3fn_bf16_lut,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -1376,6 +1376,10 @@ def rocm_inv_rope_einsum(
     return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
 
 
+# NOTE: despite the module name, the `_rocm_sparse_attn_*` Triton kernels
+# below are platform-neutral and are also the CUDA SM8x (Ampere) sparse-MLA
+# path -- see vllm/models/deepseek_v4/ampere/ampere_sparse.py. Only the
+# aiter dispatches and the gfx942/gfx950 tuning above are ROCm-specific.
 _DSV4_SPARSE_NOPE_DIM = 448
 _DSV4_SPARSE_ROPE_DIM = 64
 
@@ -1711,6 +1715,7 @@ def _sparse_attn_decode_ragged_kernel(
     extra_indices_ptr,
     extra_indptr_ptr,
     attn_sink_ptr,
+    fp8_lut_ptr,
     out_ptr,
     q_stride0,
     q_stride1,
@@ -1733,7 +1738,6 @@ def _sparse_attn_decode_ragged_kernel(
     # Compressed K-cache (extra): Triton encoder writes OCP everywhere.
     IS_FNUZ_MAIN: tl.constexpr,
     IS_FNUZ_EXTRA: tl.constexpr,
-    FP8_SOFTWARE_CONV: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -1790,19 +1794,14 @@ def _sparse_attn_decode_ragged_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ_MAIN:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-        elif FP8_SOFTWARE_CONV:
-            x_fp8 = convert_from_fp8e4m3(x_uint8, tl.bfloat16)
-        else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+        k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr)
         encoded_scales = tl.load(
             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
             mask=valid[:, None] & nope_mask[None, :],
             other=127,
         )
         scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1860,19 +1859,14 @@ def _sparse_attn_decode_ragged_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ_EXTRA:
-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-            elif FP8_SOFTWARE_CONV:
-                x_fp8 = convert_from_fp8e4m3(x_uint8, tl.bfloat16)
-            else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_EXTRA, fp8_lut_ptr)
             encoded_scales = tl.load(
                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
                 mask=valid[:, None] & nope_mask[None, :],
                 other=127,
             )
             scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1954,6 +1948,7 @@ def _sparse_attn_decode_partial_kernel(
     part_m_ptr,
     part_l_ptr,
     part_acc_ptr,
+    fp8_lut_ptr,
     q_stride0,
     q_stride1,
     main_cache_stride0,
@@ -2044,17 +2039,14 @@ def _sparse_attn_decode_partial_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ_MAIN:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-        else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+        k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr)
         encoded_scales = tl.load(
             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
             mask=valid[:, None] & nope_mask[None, :],
             other=127,
         )
         scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -2115,17 +2107,14 @@ def _sparse_attn_decode_partial_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ_EXTRA:
-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-            else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_EXTRA, fp8_lut_ptr)
             encoded_scales = tl.load(
                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
                 mask=valid[:, None] & nope_mask[None, :],
                 other=127,
             )
             scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -3090,17 +3079,12 @@ def _rocm_sparse_attn_decode_ragged_triton(
     nope_block = triton.next_power_of_2(nope_head_dim)
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
+    # Cached 512-byte table; unused (compile-time) where the
+    # hardware fp8 convert exists.
+    fp8_lut = get_e4m3fn_bf16_lut(q.device)
 
     if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
         block_k = 16 if head_dim >= 256 else 32
-        fp8_software_conv = (
-            current_platform.is_cuda()
-            and current_platform.has_device_capability(75)
-            and not current_platform.has_device_capability(89)
-        )
-        launch_kwargs = (
-            {"extern_libs": FP8E4NV_EXTERN_LIBS} if fp8_software_conv else {}
-        )
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
             q,
             main_cache,
@@ -3110,6 +3094,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             extra_indices,
             extra_indptr,
             attn_sink,
+            fp8_lut,
             out,
             q.stride(0),
             q.stride(1),
@@ -3130,11 +3115,9 @@ def _rocm_sparse_attn_decode_ragged_triton(
             ROPE_DIM=rope_head_dim,
             IS_FNUZ_MAIN=is_fnuz,
             IS_FNUZ_EXTRA=False,
-            FP8_SOFTWARE_CONV=fp8_software_conv,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
             num_warps=8,
-            **launch_kwargs,
         )
         return out
 
@@ -3231,6 +3214,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             part_m,
             part_l,
             part_acc,
+            fp8_lut,
             q.stride(0),
             q.stride(1),
             main_cache.stride(0),

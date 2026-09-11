@@ -857,6 +857,7 @@ class SparseAttnIndexer(CustomOp):
         max_model_len: int,
         max_total_seq_len: int,
         topk_indices_buffer: torch.Tensor,
+        num_heads: int,
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         compress_ratio: int = 1,
@@ -892,11 +893,41 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self._cp_kv_cache_interleave_size: int | None = None
+        # On SM80/SM121 (A100, GB10) DeepGEMM is unavailable — fall back to
+        # the Triton sparse-MLA path. is_deep_gemm_supported() encodes the
+        # SM-arch + has_deep_gemm() gate; if not supported, downgrade the
+        # hard error from upstream to a one-time warning so the indexer
+        # routes through the Triton kernels in `mqa_logits_triton.py`.
         if current_platform.is_cuda() and not is_deep_gemm_supported():
             logger.warning_once(
-                "DeepGEMM attention kernels are unavailable on this CUDA "
-                "architecture; using the Triton sparse-indexer fallback."
+                "DeepGEMM not supported on this platform; "
+                "using Triton fallback for sparse attention indexer."
             )
+            # Prime the autotune caches (and, as a side effect of the first
+            # launch, the e4m3 decode LUT) here rather than in a warmup hook:
+            # memory profiling captures cudagraphs before any hook runs, and
+            # the autotuner's synchronizing benchmark is illegal under
+            # capture.
+            from vllm.v1.attention.ops.mqa_logits_triton import (
+                warmup_fp8_mqa_logits_triton,
+                warmup_fp8_paged_mqa_logits_triton,
+            )
+
+            if not use_fp4_cache:
+                device = topk_indices_buffer.device
+                warmup_fp8_mqa_logits_triton(num_heads, head_dim, device)
+                # 64/256 are the V3.2 and V4 indexer kernel block sizes; the
+                # configured cache block size covers user-chosen values, which
+                # the backends accept as any MultipleOf(64).
+                block_sizes = {
+                    64,
+                    256,
+                    get_current_vllm_config().cache_config.block_size,
+                }
+                for kernel_block_size in sorted(block_sizes):
+                    warmup_fp8_paged_mqa_logits_triton(
+                        num_heads, head_dim, kernel_block_size, device
+                    )
 
         if vllm_config.kernel_config.enable_jit_warmup:
             from vllm.v1.attention.ops.common import (
@@ -904,10 +935,13 @@ class SparseAttnIndexer(CustomOp):
                 _UNPACK_SEQ_TRITON_KERNEL,
             )
 
-            pack_dtype = torch.uint8 if use_fp4_cache else current_platform.fp8_dtype()
+            # Pack is a raw storage copy. Register the FP8 path as uint8 so
+            # SM80 JIT warmup does not lower unsupported fp8e4nv loads/stores.
+            pack_dtype = torch.uint8
             _PACK_SEQ_TRITON_KERNEL.register_warmup(
                 dtype=pack_dtype,
-                pad_value=0 if use_fp4_cache else -float("inf"),
+                # 0 for MXFP4; 0xFE is e4m3fn(-inf) saturated to -448.
+                pad_value=0 if use_fp4_cache else 0xFE,
             )
             _UNPACK_SEQ_TRITON_KERNEL.register_warmup()
 

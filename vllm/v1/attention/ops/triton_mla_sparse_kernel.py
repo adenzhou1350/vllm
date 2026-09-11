@@ -16,15 +16,11 @@ _BLOCK_DV = 512
 _DIM_QK = _BLOCK_DMODEL + _BLOCK_DPE  # 576
 
 _BLOCK_H = 16
-# Smallest BLOCK_N the autotune sweep offers; only used for the topk-divisibility
-# check at dispatch time.
-_MIN_BLOCK_N = 16
 
 # Merge kernel grid is spread across heads and DV tiles to avoid a (1,1)
 # launch starving the SMs (pattern from FlashMLA's combine kernel).
 _MERGE_BLOCK_H = 1
 _MERGE_BLOCK_DV_TILE = 128
-assert _BLOCK_DV % _MERGE_BLOCK_DV_TILE == 0
 _NUM_MERGE_DV_TILES = _BLOCK_DV // _MERGE_BLOCK_DV_TILE
 
 # Final (prefill) and split (decode) kernels each tune to their own regime.
@@ -36,6 +32,12 @@ _FINAL_AUTOTUNE_CONFIGS = [
 _SPLIT_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=ns) for ns in (2, 4)
 ]
+
+# Smallest BLOCK_N the sweep offers; the topk-divisibility check at
+# dispatch time keeps every tile full.
+_MIN_BLOCK_N = min(
+    c.kwargs["BLOCK_N"] for c in _FINAL_AUTOTUNE_CONFIGS + _SPLIT_AUTOTUNE_CONFIGS
+)
 
 # Split-count candidates for `_choose_num_kv_splits`; also the set pre-compiled
 # by `_warmup_autotune`.
@@ -75,7 +77,6 @@ def _sparse_mla_compute_tile(
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
     offs_dv = tl.arange(0, BLOCK_DV)
-    mask_dpe = offs_dpe < BLOCK_DMODEL + BLOCK_DPE
 
     q = tl.load(
         q_buffer
@@ -90,7 +91,7 @@ def _sparse_mla_compute_tile(
         + cur_q * stride_q_token
         + cur_head[:, None] * stride_q_head
         + offs_dpe[None, :],
-        mask=(mask_h[:, None]) & (mask_dpe[None, :]),
+        mask=mask_h[:, None],
         other=0.0,
     )
 
@@ -130,7 +131,7 @@ def _sparse_mla_compute_tile(
         )
         kpe = tl.load(
             k_buffer + offs_kpe,
-            mask=(mask_kv[None, :]) & (mask_dpe[:, None]),
+            mask=mask_kv[None, :],
             other=0.0,
         )
         qk += tl.dot(qpe, kpe.to(q.dtype))
@@ -191,7 +192,7 @@ def _sparse_mla_kernel_final(
     cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = (cur_head < (cur_head_id + 1) * VALID_BLOCK_H) & (cur_head < h_q)
 
-    acc, e_max, e_sum = _sparse_mla_compute_tile(
+    acc, _, e_sum = _sparse_mla_compute_tile(
         q_buffer,
         k_buffer,
         indices_ptr,

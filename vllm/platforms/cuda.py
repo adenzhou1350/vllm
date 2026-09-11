@@ -141,6 +141,7 @@ def _get_backend_priorities(
             sparse_tail = [
                 AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
+                AttentionBackendEnum.TRITON_MLA_SPARSE,
             ]
             flashinfer_sparse = AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90
             if head_size == 512:
@@ -153,7 +154,6 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHINFER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
                 *sparse_tail,
-                AttentionBackendEnum.TRITON_MLA_SPARSE,
             ]
     else:
         # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal

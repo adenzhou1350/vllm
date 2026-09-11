@@ -195,6 +195,7 @@ class Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            num_heads=self.n_head,
         )
 
     def forward(

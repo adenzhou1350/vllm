@@ -5,6 +5,7 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
 
 # Paged decode: num_warps=4 dominated on A100/SM80 across {2,4,8}; the others
 # were 1.5–1.7× slower at (num_heads=32, head_dim=128, block_size=64), so
@@ -13,14 +14,12 @@ _PAGED_AUTOTUNE_CONFIGS = [
     triton.Config({}, num_warps=4, num_stages=ns) for ns in (2, 4)
 ]
 
-# Prefill kernel adds BLOCK_N as a free tile axis. num_warps=8 was 1.5–3×
-# worse than {2,4} across the sweep; keep BLOCK_N ∈ {32, 64, 128} so autotune
-# can pick per shape (BN=128 wins for GLM-5.1 long chunks).
+# Prefill: BLOCK_N=128 with num_warps=4 measured fastest at every shape
+# swept (M 1..2048, N 2048..131072) -- BN=64 is 1.25-1.40x worse, BN=32 up to
+# 2.41x. The autotune key is (num_heads, head_dim), both fixed for a model,
+# so a wider sweep cannot adapt per request; it only adds cold-cache JIT.
 _PREFILL_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_N": bn}, num_warps=nw, num_stages=ns)
-    for bn in (32, 64, 128)
-    for nw in (2, 4)
-    for ns in (2, 4)
+    triton.Config({"BLOCK_N": 128}, num_warps=4, num_stages=ns) for ns in (2, 4)
 ]
 
 # Warmup shape mirrors the chunked-prefill regime (small M, long N) so
@@ -30,22 +29,13 @@ _PREFILL_WARMUP_M = 8
 _PREFILL_WARMUP_N = 8192
 
 
-_E4M3FN_BF16_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
+# NaN bytes pin to +-480 so a NaN cache entry cannot poison the whole
+# logits row through the dot product.
+_INDEXER_LUT_NAN_VALUE = 480.0
 
 
 def _get_e4m3fn_bf16_lut(device: torch.device) -> torch.Tensor:
-    lut = _E4M3FN_BF16_LUT_CACHE.get(device)
-    if lut is not None:
-        return lut
-    lut = (
-        torch.arange(256, dtype=torch.uint8, device=device)
-        .view(torch.float8_e4m3fn)
-        .to(torch.bfloat16)
-    )
-    lut[0x7F] = 480.0
-    lut[0xFF] = -480.0
-    _E4M3FN_BF16_LUT_CACHE[device] = lut
-    return lut
+    return get_e4m3fn_bf16_lut(device, nan_value=_INDEXER_LUT_NAN_VALUE)
 
 
 @triton.jit
@@ -80,11 +70,8 @@ def _fp8_paged_mqa_logits_kernel(
     stride_w_h,
     stride_bt_b,
     stride_bt_k,
-    stride_ctx_b,
-    stride_ctx_n,
     stride_l_t,
     stride_l_n,
-    per_token_context: tl.constexpr,
     next_n: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -99,15 +86,11 @@ def _fp8_paged_mqa_logits_kernel(
     batch_id = token_id // next_n
     next_n_id = token_id % next_n
 
-    context_len = tl.load(
-        context_lens_ptr + batch_id * stride_ctx_b + next_n_id * stride_ctx_n
-    )
+    context_len = tl.load(context_lens_ptr + batch_id)
     if block_rk * block_size >= context_len:
         return
 
-    q_offset = (
-        context_len - 1 if per_token_context else context_len - next_n + next_n_id
-    )
+    q_offset = context_len - next_n + next_n_id
 
     # int64: unified-KV-pool layer views carry a large block stride (~1e6
     # elements), so int32 `block_idx * stride` wraps once a batch touches
@@ -156,8 +139,9 @@ def _fp8_paged_mqa_logits_kernel(
     out = tl.sum(s, axis=0)
 
     k_offset = block_rk * block_size + offs_n
-    valid = mask_n & (k_offset < context_len) & (k_offset <= q_offset)
-    out = tl.where(valid, out, float("-inf"))
+    # Store mask below covers mask_n and the context bound; -inf only has to
+    # mask the causal tail inside the written region.
+    out = tl.where(k_offset <= q_offset, out, float("-inf"))
 
     tl.store(
         logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
@@ -181,7 +165,7 @@ def fp8_paged_mqa_logits_triton(
         q:             [B, next_n, H, D] fp8_e4m3fn
         kv_cache:      [num_blocks, block_size, 1, D+4] uint8 (FP8 + fp32 scale)
         weights:       [B*next_n, H] float32
-        context_lens:  [B] final lengths, or [B, next_n] per-token lengths
+        context_lens:  [B] int32
         block_tables:  [B, max_blocks] int32
         max_model_len: output width. Caller passes the active batch max so
             the logits buffer and grid stay tight.
@@ -191,14 +175,6 @@ def fp8_paged_mqa_logits_triton(
         logits:        [B*next_n, max_model_len] float32
     """
     B, next_n, num_heads, head_dim = q.shape
-    per_token_context = context_lens.ndim == 2
-    if per_token_context:
-        assert context_lens.shape[0] == B
-        assert context_lens.shape[1] >= next_n
-        stride_ctx_b, stride_ctx_n = context_lens.stride()[:2]
-    else:
-        assert context_lens.shape == (B,)
-        stride_ctx_b, stride_ctx_n = context_lens.stride(0), 0
     _, block_size, one, d_plus_4 = kv_cache.shape
     assert one == 1
     assert d_plus_4 == head_dim + 4
@@ -234,7 +210,12 @@ def fp8_paged_mqa_logits_triton(
     BLOCK_N = triton.next_power_of_2(block_size)
 
     fp8_lut = _get_e4m3fn_bf16_lut(q.device)
-    grid = (B * next_n, block_tables.shape[1])
+    # The block table is allocated at full max_model_len width and only
+    # narrowed along dim 0, so sizing the grid by it launches a CTA per
+    # possible block rather than per live one; each surplus CTA loads
+    # context_lens and returns. max_model_len here is the active batch max.
+    num_block_cols = min(block_tables.shape[1], triton.cdiv(max_model_len, block_size))
+    grid = (B * next_n, num_block_cols)
     _fp8_paged_mqa_logits_kernel[grid](
         q_byte,
         kv_byte,
@@ -257,11 +238,8 @@ def fp8_paged_mqa_logits_triton(
         weights.stride(1),
         block_tables.stride(0),
         block_tables.stride(1),
-        stride_ctx_b,
-        stride_ctx_n,
         logits.stride(0),
         logits.stride(1),
-        per_token_context=per_token_context,
         next_n=next_n,
         num_heads=num_heads,
         head_dim=head_dim,
@@ -357,8 +335,8 @@ def _fp8_mqa_logits_kernel(
     s = tl.where(s > 0, s, 0.0) * w[:, None]
     out = tl.sum(s, axis=0)
 
-    valid = mask_n & (offs_n >= ks) & (offs_n < ke)
-    out = tl.where(valid, out, float("-inf"))
+    # Store mask below covers mask_n; -inf masks the [ks, ke) range only.
+    out = tl.where((offs_n >= ks) & (offs_n < ke), out, float("-inf"))
 
     tl.store(
         logits_ptr + m * stride_l_m + offs_n * stride_l_n,
@@ -394,10 +372,10 @@ def fp8_mqa_logits_triton(
     M, num_heads, head_dim = q.shape
     N = k_fp8.shape[0]
 
-    if clean_logits:
-        logits = torch.full((M, N), float("-inf"), dtype=torch.float32, device=q.device)
-    else:
-        logits = torch.empty((M, N), dtype=torch.float32, device=q.device)
+    # The grid covers every (m, n_block) and each tile stores its full row
+    # span, so a -inf pre-fill would be entirely overwritten; `clean_logits`
+    # is accepted for DeepGEMM signature parity only.
+    logits = torch.empty((M, N), dtype=torch.float32, device=q.device)
 
     BLOCK_H = max(16, triton.next_power_of_2(num_heads))
     BLOCK_D = triton.next_power_of_2(head_dim)
@@ -442,9 +420,8 @@ def warmup_fp8_mqa_logits_triton(
     """Prime the prefill `@triton.autotune` cache so first-call doesn't pay
     the inline sweep (~5–8 s on A100 SM80). N is a runtime scalar, so one
     small-M / long-N shape covers all chunk lengths."""
-    max_block_n = max(c.kwargs["BLOCK_N"] for c in _PREFILL_AUTOTUNE_CONFIGS)
     m = _PREFILL_WARMUP_M
-    n = max(_PREFILL_WARMUP_N, max_block_n)
+    n = _PREFILL_WARMUP_N
     q = torch.empty(m, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device)
     k = torch.empty(n, head_dim, dtype=torch.float8_e4m3fn, device=device)
     scales = torch.zeros(n, dtype=torch.float32, device=device)

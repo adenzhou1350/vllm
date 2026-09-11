@@ -21,6 +21,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.attention.ops.fp8_sm80 import _encode_e4m3fn_u8
 
 
 class FusedInvRopeFP8QuantKernel(
@@ -160,7 +161,10 @@ class FusedInvRopeFP8QuantKernel(
             ),
             (HEAD_DIM,),
         )
-        x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
+        # Store encoded bytes so pre-SM89 CUDA never specializes either the
+        # conversion or output pointer as fp8e4nv. The helper keeps the native
+        # cast on architectures where Triton supports it.
+        x_quant = _encode_e4m3fn_u8(tl.clamp(x / scales_exp, -fp8_max, fp8_max))
 
         out_base = (
             out_ptr
@@ -284,7 +288,7 @@ class FusedInvRopeFP8QuantKernel(
                 shape=(1, compile_key.half_rope * 2),
             ),
             out_buf=TritonWarmupTensor(
-                torch.float8_e4m3fn if compile_key.quantize else torch.bfloat16,
+                torch.uint8 if compile_key.quantize else torch.bfloat16,
                 shape=(compile_key.heads_per_group, 1, out_dim),
                 strides=(out_dim, out_dim, 1),
             ),
@@ -474,7 +478,7 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
         o,
         positions,
         cos_sin_cache,
-        out_buf,
+        out_buf.view(torch.uint8) if quantize else out_buf,
         scale_buf,
         num_tokens,
         heads_per_group=heads_per_group,

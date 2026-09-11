@@ -179,12 +179,22 @@ def pack_seq_triton(
     Returns:
         packed: [B, Lmax, ...] — packed tensor.
     """
+    is_fp8_e4m3fn = x.dtype == torch.float8_e4m3fn
     is_uint8 = x.dtype == torch.uint8
     if is_uint8:
         assert isinstance(pad_value, int) and 0 <= pad_value <= 255, (
             f"uint8 pack requires an integer pad in [0, 255], got {pad_value!r}"
         )
         pad_constexpr: int | float = int(pad_value)
+    elif is_fp8_e4m3fn:
+        # Pack is a byte copy. Present FP8 storage as uint8 so Triton does not
+        # specialize its load/store pointers as fp8e4nv on pre-SM89 CUDA.
+        pad_constexpr = int(
+            torch.tensor(float(pad_value), dtype=torch.float32)
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+            .item()
+        )
     else:
         pad_constexpr = float(pad_value)
 
@@ -204,15 +214,17 @@ def pack_seq_triton(
     out = torch.empty((B, Lmax, D), device=x.device, dtype=x.dtype)
 
     lengths = lengths.int()
+    kernel_x = x_reshaped.view(torch.uint8) if is_fp8_e4m3fn else x_reshaped
+    kernel_out = out.view(torch.uint8) if is_fp8_e4m3fn else out
     _PACK_SEQ_TRITON_KERNEL(
-        x_reshaped,
-        out,
+        kernel_x,
+        kernel_out,
         lengths,
         N=N,
         D=D,
         Lmax=Lmax,
         pad_value=pad_constexpr,
-        pad_is_uint8=is_uint8,
+        pad_is_uint8=is_uint8 or is_fp8_e4m3fn,
         block_t=block_t,
         block_d=block_d,
     )
@@ -364,9 +376,14 @@ def unpack_seq_triton(
     out = torch.empty((N, D), device=packed_tensor.device, dtype=packed_tensor.dtype)
 
     lengths = lengths.int()
+    is_fp8_e4m3fn = packed_tensor.dtype == torch.float8_e4m3fn
+    kernel_packed = (
+        packed_reshaped.view(torch.uint8) if is_fp8_e4m3fn else packed_reshaped
+    )
+    kernel_out = out.view(torch.uint8) if is_fp8_e4m3fn else out
     _UNPACK_SEQ_TRITON_KERNEL(
-        packed_reshaped,
-        out,
+        kernel_packed,
+        kernel_out,
         lengths,
         B=B,
         Lmax=Lmax,
