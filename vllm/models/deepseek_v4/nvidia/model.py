@@ -1101,10 +1101,11 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
                 f"{backend.name} is not supported for DeepSeek V4 on SM8x; "
                 "use TRITON_MLA_SPARSE_DSV4 (default)."
             )
-        if vllm_config.attention_config.use_fp4_indexer_cache:
+        indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype("fp8")
+        if indexer_kv_dtype != "fp8":
             raise ValueError(
-                "attention_config.use_fp4_indexer_cache requires SM100; "
-                "the MXFP4 indexer kernels emit Blackwell-only PTX."
+                f"attention_config.indexer_kv_dtype={indexer_kv_dtype!r} is not "
+                "supported for DeepSeek V4 on SM8x; use 'auto' or 'fp8'."
             )
         from vllm.models.deepseek_v4.ampere.ampere_sparse import (
             DeepseekV4AmpereMLAAttention,
