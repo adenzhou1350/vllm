@@ -12,6 +12,7 @@ import vllm.model_executor.layers.mhc as mhc_layers
 from vllm.model_executor.kernels.mhc.tilelang import (
     _tilelang_hc_prenorm_gemm,
     _torch_hc_prenorm_gemm,
+    mhc_pre_broadcast_tilelang,
     mhc_pre_delayed_tilelang,
 )
 from vllm.model_executor.kernels.mhc.torch import mhc_pre_delayed_torch
@@ -449,6 +450,63 @@ def test_mhc_pre_tilelang(num_tokens, hidden_size, hc_mult):
 
     for actual, expected in zip(out, ref, strict=True):
         torch.testing.assert_close(actual, expected, atol=5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not HAS_TILELANG_MHC or not current_platform.is_cuda(),
+    reason="CUDA TileLang MHC support required",
+)
+def test_mhc_pre_broadcast_without_deep_gemm_matches_torch(monkeypatch):
+    """The first V4 layer must work on SM80, where DeepGEMM is unavailable."""
+    monkeypatch.setattr("vllm.utils.deep_gemm.is_deep_gemm_supported", lambda: False)
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+
+    num_tokens, hidden_size, hc_mult = 1, 7168, 4
+    hc_mult3 = 2 * hc_mult + hc_mult * hc_mult
+    residual = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16)
+    fn = torch.randn((hc_mult3, hc_mult * hidden_size), dtype=torch.float32) * 1e-4
+    fn_broadcast = fn.view(hc_mult3, hc_mult, hidden_size).sum(dim=1)
+    hc_scale = torch.randn((3,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float32) * 0.1
+    norm_weight = torch.empty(hidden_size, dtype=torch.bfloat16).uniform_(0.5, 1.5)
+    rms_eps = hc_pre_eps = hc_sinkhorn_eps = norm_eps = 1e-6
+    sinkhorn_repeat = 20
+    hc_post_alpha = 1.0
+
+    expanded = residual[:, None, :].expand(-1, hc_mult, -1).contiguous()
+    post_ref, mix_ref, layer_input_ref = mhc_pre_ref(
+        expanded,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_alpha,
+        sinkhorn_repeat,
+    )
+    layer_input_ref = F.rms_norm(layer_input_ref, (hidden_size,), norm_weight, norm_eps)
+
+    residual_out, post_mix, comb_mix, layer_input = mhc_pre_broadcast_tilelang(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_alpha,
+        sinkhorn_repeat,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        fn_broadcast=fn_broadcast,
+    )
+
+    torch.testing.assert_close(residual_out, expanded, atol=0, rtol=0)
+    torch.testing.assert_close(post_mix, post_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(comb_mix, mix_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(layer_input, layer_input_ref, atol=2e-2, rtol=1e-2)
 
 
 @pytest.mark.skipif(
