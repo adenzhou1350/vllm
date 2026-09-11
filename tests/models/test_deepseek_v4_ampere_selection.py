@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
 from types import SimpleNamespace
+from types import ModuleType
 
 import pytest
 
@@ -10,6 +12,10 @@ from vllm.models.deepseek_v4.nvidia import model as dsv4_model
 
 class _SM80Capability:
     major = 8
+
+
+class _AmpereAttention:
+    pass
 
 
 class _AttentionConfig:
@@ -37,17 +43,20 @@ def _force_sm80(monkeypatch: pytest.MonkeyPatch):
         "get_device_capability",
         lambda: _SM80Capability(),
     )
+    ampere_module = ModuleType("vllm.models.deepseek_v4.ampere.ampere_sparse")
+    ampere_module.DeepseekV4AmpereMLAAttention = _AmpereAttention
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.models.deepseek_v4.ampere.ampere_sparse",
+        ampere_module,
+    )
 
 
 @pytest.mark.parametrize("indexer_kv_dtype", ["auto", "fp8"])
 def test_sm80_attention_selection_accepts_fp8_indexer(indexer_kv_dtype: str):
     attention_cls = dsv4_model._select_dsv4_attn_cls(_config(indexer_kv_dtype))
 
-    from vllm.models.deepseek_v4.ampere.ampere_sparse import (
-        DeepseekV4AmpereMLAAttention,
-    )
-
-    assert attention_cls is DeepseekV4AmpereMLAAttention
+    assert attention_cls is _AmpereAttention
 
 
 @pytest.mark.parametrize("indexer_kv_dtype", ["bf16", "mxfp4", "nvfp4"])
