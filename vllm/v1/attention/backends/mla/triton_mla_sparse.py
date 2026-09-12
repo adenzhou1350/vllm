@@ -86,6 +86,10 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
 class TritonMLASparseBackend(XPUMLASparseBackend):
     """Same bf16 sparse-MLA contract as the XPU backend, CUDA Triton kernels."""
 
+    # triton_mla_sparse_attention currently materializes and stores bf16
+    # output, so advertising fp16 would violate the backend dtype contract.
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+
     @staticmethod
     def get_name() -> str:
         return "TRITON_MLA_SPARSE"
