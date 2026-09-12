@@ -224,7 +224,9 @@ def test_index_conversion_warmup_uses_physical_block_stride():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_num_states():
+def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_num_states(
+    tmp_path,
+):
     """Regression test: DeepseekV4 compression path must compute slot_mapping from
     compressed positions, not reuse the uncompressed common metadata mapping.
     """
@@ -238,7 +240,15 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_num_states():
         dtype=torch.bfloat16,
         tokens_per_state=4,
     )
-    vllm_config = create_vllm_config(max_model_len=1024)
+    # Keep this kernel regression hermetic. create_vllm_config defaults to a
+    # gated Hugging Face model and would otherwise require network access.
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    vllm_config = create_vllm_config(
+        model_name=str(tmp_path),
+        max_model_len=1024,
+    )
     max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, 1024)
     block_table_width = get_block_table_width(max_num_blocks, kv_cache_spec.block_size)
     builder = DeepseekV32IndexerMetadataBuilder(
