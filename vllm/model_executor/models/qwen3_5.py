@@ -226,6 +226,35 @@ class Qwen3_5Model(Qwen3NextModel):
         }
     )
 
+    @staticmethod
+    def remap_packed_gdn_input_projections(
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        projection_shards = (
+            (".in_proj_qkvz.", (0, 1, 2, 3)),
+            (".in_proj_qkv.", (0, 1, 2)),
+            (".in_proj_z.", 3),
+            (".in_proj_b.", 4),
+            (".in_proj_a.", 5),
+        )
+        for name, weight in weights:
+            if ".in_proj_ba." in name:
+                if weight.shape[0] % 2 != 0:
+                    raise ValueError(
+                        "Qwen3.5 in_proj_ba must contain equally sized b/a shards"
+                    )
+                name = name.replace(".in_proj_ba.", ".in_proj_qkvzba.", 1)
+                for shard_id, shard in zip((4, 5), weight.chunk(2, dim=0)):
+                    shard.shard_id = shard_id
+                    yield name, shard
+                continue
+            for source, shard_id in projection_shards:
+                if source in name:
+                    name = name.replace(source, ".in_proj_qkvzba.", 1)
+                    weight.shard_id = shard_id
+                    break
+            yield name, weight
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Qwen3NextModel, self).__init__()
 
@@ -239,6 +268,11 @@ class Qwen3_5Model(Qwen3NextModel):
 
         self.config = config
         self.quant_config = vllm_config.quant_config
+        self.use_packed_gdn_input_projection = (
+            QwenGatedDeltaNetAttention.supports_packed_input_projection(
+                vllm_config, gqa_interleaved_layout=False
+            )
+        )
 
         self.vocab_size = config.vocab_size
 
@@ -286,7 +320,11 @@ class Qwen3_5Model(Qwen3NextModel):
                 ckpt_prefix="mlp.shared_expert",
             )
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        mapper = self.hf_to_vllm_mapper
+        if self.use_packed_gdn_input_projection:
+            weights = self.remap_packed_gdn_input_projections(weights)
+            mapper = Qwen3NextModel.hf_to_vllm_mapper
+        return loader.load_weights(weights, mapper=mapper)
 
 
 class Qwen3_5ForCausalLMBase(
