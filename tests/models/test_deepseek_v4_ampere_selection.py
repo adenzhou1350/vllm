@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -33,6 +34,26 @@ def _config(indexer_kv_dtype: str):
     return SimpleNamespace(
         attention_config=_AttentionConfig(indexer_kv_dtype),
     )
+
+
+def test_ampere_import_does_not_load_rocm_platform(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delitem(
+        sys.modules,
+        "vllm.models.deepseek_v4.ampere.ampere_sparse",
+        raising=False,
+    )
+    monkeypatch.delitem(
+        sys.modules,
+        "vllm.models.deepseek_v4.amd.rocm",
+        raising=False,
+    )
+    monkeypatch.delitem(sys.modules, "vllm.platforms.rocm", raising=False)
+
+    importlib.import_module("vllm.models.deepseek_v4.ampere.ampere_sparse")
+
+    assert "vllm.platforms.rocm" not in sys.modules
 
 
 @pytest.fixture(autouse=True)

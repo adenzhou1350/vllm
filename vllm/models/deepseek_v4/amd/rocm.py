@@ -21,7 +21,12 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4SparseMLAMetadataBuilder,
 )
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import _ON_GFX950
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import _ON_GFX950
+else:
+    _ON_GFX950 = False
+
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
