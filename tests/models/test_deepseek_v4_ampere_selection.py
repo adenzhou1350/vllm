@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from vllm.models.deepseek_v4 import attention as dsv4_attention
+from vllm.models.deepseek_v4 import compressor as dsv4_compressor
 from vllm.models.deepseek_v4.nvidia import model as dsv4_model
 
 
@@ -111,3 +112,33 @@ def test_dsv4_cutedsl_warmup_requires_cuda_and_supported_arch(
     )
 
     assert dsv4_attention._use_cutedsl_warmup() is expected
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "is_cuda", "is_supported", "expected"),
+    [
+        (512, True, False, False),
+        (512, True, True, True),
+        (512, False, True, False),
+        (128, True, True, False),
+    ],
+)
+def test_dsv4_cutedsl_compressor_warmup_matches_dispatch_support(
+    monkeypatch: pytest.MonkeyPatch,
+    head_dim: int,
+    is_cuda: bool,
+    is_supported: bool,
+    expected: bool,
+):
+    monkeypatch.setattr(
+        dsv4_compressor.current_platform,
+        "is_cuda",
+        lambda: is_cuda,
+    )
+    monkeypatch.setattr(
+        dsv4_compressor,
+        "is_cutedsl_supported",
+        lambda: is_supported,
+    )
+
+    assert dsv4_compressor._use_cutedsl_compressor(head_dim) is expected
