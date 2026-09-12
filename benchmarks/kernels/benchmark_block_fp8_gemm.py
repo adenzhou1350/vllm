@@ -10,6 +10,8 @@ import torch
 
 from vllm.benchmarks.lib.utils import default_vllm_config
 from vllm.model_executor.kernels.linear import (
+    CutlassFp8BlockScaledMMKernel,
+    TritonFp8BlockScaledMMKernel,
     init_fp8_linear_kernel,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -71,6 +73,9 @@ def build_w8a8_block_fp8_runner(M, N, K, block_size, device, use_cutlass):
     weight_group_shape = GroupShape(block_n, block_k)
     act_quant_group_shape = GroupShape(1, block_k)  # Per-token, per-group quantization
 
+    kernel_cls = (
+        CutlassFp8BlockScaledMMKernel if use_cutlass else TritonFp8BlockScaledMMKernel
+    )
     linear_op = init_fp8_linear_kernel(
         weight_quant_key=create_fp8_quant_key(
             static=True, group_shape=weight_group_shape
@@ -78,18 +83,19 @@ def build_w8a8_block_fp8_runner(M, N, K, block_size, device, use_cutlass):
         activation_quant_key=create_fp8_quant_key(
             static=False, group_shape=act_quant_group_shape
         ),
-        out_dtype=torch.get_default_dtype(),
-        module_name="build_w8a8_block_fp8_runner",
+        input_dtype=A_ref.dtype,
+        out_dtype=A_ref.dtype,
+        weight_shape=(N, K),
+        force_kernel=kernel_cls,
+        module_name=f"build_w8a8_block_fp8_runner[{kernel_cls.__name__}]",
     )
 
+    layer = torch.nn.Module()
+    layer.register_buffer("weight", B)
+    layer.register_buffer("weight_scale", Bs)
+
     def run():
-        return linear_op.apply(
-            input=A_ref,
-            weight=B,
-            weight_scale=Bs,
-            input_scale=None,
-            bias=None,
-        )
+        return linear_op.apply_weights(layer, A_ref)
 
     return run
 
