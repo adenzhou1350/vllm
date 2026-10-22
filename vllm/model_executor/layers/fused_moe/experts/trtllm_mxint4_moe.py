@@ -158,6 +158,7 @@ class TrtLlmMxint4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             num_expert_group=num_expert_group,
             topk_group=topk_group,
             e_score_correction_bias=e_score_correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
             routing_method_type=self.routing_method,
             routing_replay_out=routing_replay_out,
         )

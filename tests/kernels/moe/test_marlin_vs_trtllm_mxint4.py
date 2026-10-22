@@ -6,6 +6,11 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    int4_w4a16_moe_quant_config,
+)
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
     fused_marlin_moe,
 )
@@ -281,22 +286,17 @@ def test_marlin_vs_trtllm_mxint4_moe_kimik2(monkeypatch, m, n, k, e, topk, group
 
 
 @pytest.mark.skipif(not TRTLLM_GEN_AVAILABLE, reason="Skip for non SM100")
-@pytest.mark.parametrize("m", [1, 33])
-@pytest.mark.parametrize("n", [7168])
-@pytest.mark.parametrize("k", [512])
-@pytest.mark.parametrize("e", [384])
-@pytest.mark.parametrize("topk", [8])
+@pytest.mark.parametrize(
+    "m,n,k,e,topk",
+    [(1, 7168, 512, 384, 8), (33, 7168, 512, 384, 8), (1, 256, 512, 64, 8)],
+)
+@pytest.mark.parametrize("routed_scaling_factor", [None, 2.5])
 @torch.inference_mode()
-def test_flashinfer_trtllm_mxint4_moe_wrapper(m, n, k, e, topk):
-    """Test that the flashinfer_trtllm_mxint4_moe wrapper matches the raw
-    trtllm_mxint4_block_scale_moe kernel call."""
+def test_flashinfer_trtllm_mxint4_moe_wrapper(m, n, k, e, topk, routed_scaling_factor):
+    """The monolithic expert must preserve scaling through both wrapper layers."""
     pytest.importorskip("flashinfer")
     from flashinfer import RoutingMethodType
     from flashinfer.fused_moe import trtllm_mxint4_block_scale_moe
-
-    from vllm.model_executor.layers.quantization.utils.flashinfer_mxint4_moe import (
-        flashinfer_trtllm_mxint4_moe,
-    )
 
     set_random_seed(0)
     dtype = torch.bfloat16
@@ -339,7 +339,7 @@ def test_flashinfer_trtllm_mxint4_moe_wrapper(m, n, k, e, topk):
         intermediate_size=n,
         local_expert_offset=0,
         local_num_experts=e,
-        routed_scaling_factor=None,
+        routed_scaling_factor=routed_scaling_factor,
         routing_method_type=RoutingMethodType.DeepSeekV3,
         enable_pdl=None,
         output=None,
@@ -349,25 +349,95 @@ def test_flashinfer_trtllm_mxint4_moe_wrapper(m, n, k, e, topk):
         raw_out = raw_out[0]
     raw_out = raw_out.to(dtype)
 
-    # Wrapper call
-    wrapper_out = flashinfer_trtllm_mxint4_moe(
-        x=a,
+    config = FusedMoEConfig(
+        num_experts=e,
+        experts_per_token=topk,
+        hidden_dim=k,
+        intermediate_size=n,
+        num_local_experts=e,
+        num_logical_experts=e,
+        activation=MoEActivation.SILU,
+        device=torch.device("cuda"),
+        routing_method=RoutingMethodType.DeepSeekV3,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        in_dtype=dtype,
+        router_logits_dtype=torch.float32,
+        max_num_tokens=m,
+        swiglu_limit=None,
+    )
+    quant_config = int4_w4a16_moe_quant_config(
+        prepared["gemm1_scales"], prepared["gemm2_scales"], block_shape=[1, 32]
+    )
+    experts = TrtLlmMxint4ExpertsMonolithic(config, quant_config)
+    experts_out = experts.apply(
+        hidden_states=a,
+        w1=prepared["gemm1_weights"],
+        w2=prepared["gemm2_weights"],
         router_logits=router_logits,
-        w13_weight_packed=prepared["gemm1_weights"],
-        w13_weight_scale=prepared["gemm1_scales"],
-        w2_weight_packed=prepared["gemm2_weights"],
-        w2_weight_scale=prepared["gemm2_scales"],
+        activation=MoEActivation.SILU,
         global_num_experts=e,
-        top_k=topk,
-        intermediate_size_per_partition=n,
-        local_num_experts=e,
-        ep_rank=0,
+        expert_map=None,
+        a1q_scale=None,
+        apply_router_weight_on_input=False,
         num_expert_group=1,
         topk_group=1,
         e_score_correction_bias=routing_bias,
-        routing_method_type=RoutingMethodType.DeepSeekV3,
+        routed_scaling_factor=routed_scaling_factor,
     )
+    assert experts_out.shape == (m, k)
+    assert experts_out.dtype == dtype
+    torch.testing.assert_close(experts_out, raw_out, atol=0.0, rtol=0.0)
 
-    assert wrapper_out.shape == (m, k)
-    assert wrapper_out.dtype == dtype
-    torch.testing.assert_close(wrapper_out, raw_out, atol=0.0, rtol=0.0)
+
+def _model_moe_backends(model):
+    backends = []
+    for module in model.modules():
+        method = getattr(module, "quant_method", None)
+        backend = getattr(method, "wna16_backend", None)
+        if method is not None and backend is not None:
+            backends.append((backend.name, method.group_size))
+    return model.config.route_scale, backends
+
+
+@pytest.mark.skipif(not TRTLLM_GEN_AVAILABLE, reason="Skip for non SM100")
+def test_trtllm_mxint4_model_routed_scale(vllm_runner, monkeypatch):
+    """Nonunit routed scaling must preserve real-model output against Marlin."""
+    from tests.models.utils import check_logprobs_close
+
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_INT4", "1")
+    prompts = [
+        "The capital of France is",
+        "2 + 2 =",
+        "Translate hello to French:",
+        "def add(a, b):\n    return",
+    ]
+    outputs = {}
+    for backend in ("marlin", "flashinfer_trtllm"):
+        with vllm_runner(
+            "cyankiwi/Trinity-Mini-AWQ-4bit",
+            revision="6d60de14ccb37fd31dd9d760e47ecf8a6c6b092d",
+            trust_remote_code=False,
+            dtype="bfloat16",
+            enforce_eager=True,
+            max_model_len=128,
+            max_num_batched_tokens=128,
+            max_num_seqs=1,
+            kv_cache_memory_bytes=128 * 1024**2,
+            gpu_memory_utilization=0.25,
+            enable_prefix_caching=False,
+            enable_chunked_prefill=True,
+            seed=0,
+            kernel_config={"moe_backend": backend},
+        ) as model:
+            selected = model.llm.apply_model(_model_moe_backends)
+            expected = "MARLIN" if backend == "marlin" else "FLASHINFER_TRTLLM"
+            assert selected == [(2.826, [(expected, 32)] * 30)]
+            outputs[backend] = model.generate_greedy_logprobs(prompts, 8, 10)
+
+    check_logprobs_close(
+        outputs_0_lst=outputs["marlin"],
+        outputs_1_lst=outputs["flashinfer_trtllm"],
+        name_0="marlin",
+        name_1="flashinfer_trtllm",
+        warn_on_mismatch=False,
+    )

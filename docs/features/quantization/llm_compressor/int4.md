@@ -126,6 +126,34 @@ lm_eval --model vllm \
 !!! note
     Quantized models can be sensitive to the presence of the `bos` token. Make sure to include the `add_bos_token=True` argument when running evaluations.
 
+## FlashInfer TensorRT-LLM MXINT4 MoE
+
+Compatible W4A16 MoE checkpoints can use FlashInfer's TensorRT-LLM MXINT4
+backend on supported SM100-family GPUs. The backend requires symmetric INT4
+expert weights with a group size of 32. Enable the opt-in before importing
+vLLM; it is disabled by default:
+
+```python
+import os
+
+os.environ["VLLM_USE_FLASHINFER_MOE_INT4"] = "1"
+
+from vllm import LLM
+
+llm = LLM(
+    model="cyankiwi/Trinity-Mini-AWQ-4bit",
+    revision="6d60de14ccb37fd31dd9d760e47ecf8a6c6b092d",
+    kernel_config={"moe_backend": "flashinfer_trtllm"},
+)
+```
+
+Backend selection still checks the model's routing, activation, and parallel
+configuration. The switch does not convert a group-size-128 checkpoint to
+group size 32; use weights prepared for the supported quantization scheme.
+The model-defined routed-expert scaling factor is preserved. Models that apply
+this scaling in the common output path retain that behavior; do not add an
+extra scaling step around the MoE output.
+
 ## Best Practices
 
 - Start with 512 samples for calibration data, and increase if accuracy drops

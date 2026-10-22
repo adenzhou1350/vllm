@@ -191,6 +191,7 @@ def flashinfer_trtllm_mxint4_moe(
     e_score_correction_bias: torch.Tensor | None = None,
     routing_method_type: int | None = None,
     routing_replay_out: torch.Tensor | None = None,
+    routed_scaling_factor: float | None = None,
 ) -> torch.Tensor:
     """Apply FlashInfer TensorRT-LLM MxInt4 MoE kernel.
 
@@ -212,6 +213,7 @@ def flashinfer_trtllm_mxint4_moe(
             so they can be replayed later
         e_score_correction_bias: Optional routing bias. dtype: bfloat16
         routing_method_type: FlashInfer RoutingMethodType enum value
+        routed_scaling_factor: Optional multiplier for routed expert weights
 
     Returns:
         Output tensor from MoE layer. dtype: same as x (bfloat16)
@@ -259,7 +261,7 @@ def flashinfer_trtllm_mxint4_moe(
         intermediate_size=intermediate_size_per_partition,
         local_expert_offset=ep_rank * local_num_experts,
         local_num_experts=local_num_experts,
-        routed_scaling_factor=None,
+        routed_scaling_factor=routed_scaling_factor,
         routing_method_type=routing_method_type,
         enable_pdl=None,
         do_finalize=True,

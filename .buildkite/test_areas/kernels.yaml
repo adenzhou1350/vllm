@@ -600,6 +600,8 @@ steps:
   - vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py
   - vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py
   - vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py
+  - vllm/model_executor/layers/fused_moe/experts/trtllm_mxint4_moe.py
+  - vllm/model_executor/layers/quantization/utils/flashinfer_mxint4_moe.py
   - vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
   - vllm/model_executor/layers/fused_moe/prepare_finalize/flashinfer_nvlink_one_sided.py
   - vllm/model_executor/layers/fused_moe/prepare_finalize/flashinfer_nvlink_two_sided.py
@@ -632,6 +634,9 @@ steps:
   - tests/kernels/quantization/test_silu_mul_nvfp4_quant.py
   - tests/kernels/quantization/test_block_fp8.py
   - tests/models/quantization/test_nvfp4.py
+  - tests/kernels/moe/test_marlin_vs_trtllm_mxint4.py
+  - tests/models/utils.py
+  - tests/conftest.py
   commands:
     - nvidia-smi
     - |
@@ -645,6 +650,7 @@ steps:
           pytest -v -s tests/kernels/test_top_k_per_row.py
           pytest -v -s tests/kernels/quantization/test_silu_mul_nvfp4_quant.py
           pytest -v -s tests/kernels/quantization/test_flashinfer_scaled_mm.py
+          pytest -v -s tests/kernels/moe/test_marlin_vs_trtllm_mxint4.py::test_flashinfer_trtllm_mxint4_moe_wrapper -k 256-512-64
           pytest -v -s tests/kernels/moe/test_nvfp4_moe.py
           pytest -v -s tests/kernels/moe/test_ocp_mx_moe.py
           pytest -v -s tests/kernels/test_bf16x3_router_gemm_cutedsl.py
@@ -659,6 +665,7 @@ steps:
           pytest -v -s tests/kernels/moe/test_flashinfer_moe.py
           pytest -v -s tests/kernels/moe/test_cutedsl_moe.py
           pytest -v -s tests/models/quantization/test_nvfp4.py
+          pytest -v -s tests/kernels/moe/test_marlin_vs_trtllm_mxint4.py::test_trtllm_mxint4_model_routed_scale
           ;;
         2)
           pytest -v -s tests/kernels/attention/test_flashinfer.py -k 'not num_heads2'
