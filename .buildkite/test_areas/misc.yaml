@@ -582,11 +582,11 @@ steps:
       uv run --no-project --offline --python "$(command -v python)" python -c \
         'import torch; assert torch.cuda.device_count() >= 2; print(",".join("GPU-" + str(torch.cuda.get_device_properties(i).uuid).removeprefix("GPU-") for i in range(2)))'
     )"
-    export CUDA_VISIBLE_DEVICES="$pynv_devices"
+    export CUDA_VISIBLE_DEVICES="$$pynv_devices"
     pynv_mps_root="$(mktemp -d /tmp/vllm-pynv-mps.XXXXXX)"
-    export CUDA_MPS_PIPE_DIRECTORY="$pynv_mps_root"
-    export CUDA_MPS_LOG_DIRECTORY="$pynv_mps_root/log"
-    mkdir "$CUDA_MPS_LOG_DIRECTORY"
+    export CUDA_MPS_PIPE_DIRECTORY="$$pynv_mps_root"
+    export CUDA_MPS_LOG_DIRECTORY="$$pynv_mps_root/log"
+    mkdir "$$CUDA_MPS_LOG_DIRECTORY"
     trap 'printf "quit\n" | nvidia-cuda-mps-control' EXIT
     nvidia-cuda-mps-control -d
     pytest -v -s \
