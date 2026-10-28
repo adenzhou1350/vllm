@@ -275,13 +275,8 @@ class PyNvVideoCodecVideoBackendMixin:
     def _torch_stream_context(stream):
         import torch
 
-        torch.accelerator.set_device_index(stream.device.index)
-        previous_stream = torch.accelerator.current_stream()
-        torch.accelerator.set_stream(stream)
-        try:
+        with torch.cuda.stream(stream):
             yield
-        finally:
-            torch.accelerator.set_stream(previous_stream)
 
     @classmethod
     @contextmanager

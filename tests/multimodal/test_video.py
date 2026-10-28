@@ -11,11 +11,13 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+import pybase64 as base64
 import pytest
 import torch
 from transformers import AutoVideoProcessor, Qwen3VLVideoProcessor
 from transformers.video_utils import VideoMetadata
 
+from vllm import SamplingParams
 from vllm.assets.base import get_vllm_public_assets
 from vllm.models.minimax_m3.common.mm_preprocess import MiniMaxM3VideoBackend
 from vllm.multimodal.video import (
@@ -46,6 +48,7 @@ from vllm.multimodal.video_decoders.pynvvideocodec import (
 )
 from vllm.platforms import current_platform
 from vllm.transformers_utils.processor import get_video_processor_cls_name_from_config
+from vllm.transformers_utils.utils import maybe_model_redirect
 
 from .utils import (
     create_edit_list_trimmed_video,
@@ -2383,3 +2386,92 @@ def test_clef_omni_backend_samples_reference_frames(tmp_path):
     assert metadata["do_sample_frames"] is False
     for frame, idx in zip(frames, [0, 15, 30, 45]):
         assert abs(round(float(np.asarray(frame).mean())) - idx) <= 1
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or torch.accelerator.device_count() < 2,
+    reason="requires two CUDA devices",
+)
+@pytest.mark.parametrize(
+    "caller_device,raise_body",
+    [(0, False), (1, False), (0, True), (1, True)],
+    ids=["same-normal", "cross-normal", "same-error", "cross-error"],
+)
+def test_pynvvideocodec_stream_context_restores_device(caller_device, raise_body):
+    caller = torch.cuda.Stream(device=caller_device)
+    with torch.cuda.stream(caller):
+        previous_target = torch.cuda.current_stream(0)
+        target = PyNvVideoCodecVideoBackendMixin._create_decoder_slot().stream
+        with ExitStack() as stack:
+            if raise_body:
+                stack.enter_context(pytest.raises(ValueError, match="decode failed"))
+            with PyNvVideoCodecVideoBackendMixin._torch_stream_context(target):
+                assert torch.accelerator.current_device_index() == 0
+                assert torch.cuda.current_stream() == target
+                if raise_body:
+                    raise ValueError("decode failed")
+        assert torch.accelerator.current_device_index() == caller_device
+        assert torch.cuda.current_stream(caller_device) == caller
+        assert torch.cuda.current_stream(0) == previous_target
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or torch.accelerator.device_count() < 2,
+    reason="requires two CUDA devices",
+)
+def test_pynvvideocodec_chat_restores_device(vllm_runner):
+    video = create_long_gop_video(num_frames=6, fps=6)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": "data:video/mp4;base64,"
+                        + base64.b64encode(video).decode(),
+                    },
+                },
+                {"type": "text", "text": "Describe the brightness changes briefly."},
+            ],
+        }
+    ]
+    with vllm_runner(
+        maybe_model_redirect("Qwen/Qwen3.5-0.8B"),
+        trust_remote_code=False,
+        dtype="bfloat16",
+        enforce_eager=True,
+        enable_chunked_prefill=True,
+        max_model_len=512,
+        max_num_batched_tokens=512,
+        max_num_seqs=1,
+        gpu_memory_utilization=0.04,
+        # The budget includes the frontend video-decoder reservations.
+        kv_cache_memory_bytes=6 * 1024**3,
+        skip_mm_profiling=True,
+        mm_encoder_attn_backend="TORCH_SDPA",
+        limit_mm_per_prompt={"video": 1, "image": 0},
+        media_io_kwargs={
+            "video": {"backend": "pynvvideocodec", "num_frames": 4, "hw_decoders": 1}
+        },
+        mm_ipc_gpu_memory_gb=3,
+        mm_processor_cache_gb=0,
+    ) as runner:
+        token_ids = []
+        for caller_device in (0, 1):
+            stream = torch.cuda.Stream(device=caller_device)
+            with torch.cuda.stream(stream):
+                outputs = runner.get_llm().chat(
+                    messages,
+                    sampling_params=SamplingParams(
+                        temperature=0, max_tokens=4, ignore_eos=True
+                    ),
+                    use_tqdm=False,
+                    chat_template_kwargs={"enable_thinking": False},
+                )
+                assert torch.accelerator.current_device_index() == caller_device
+                assert torch.cuda.current_stream(caller_device) == stream
+            assert len(outputs) == 1 and len(outputs[0].outputs) == 1
+            token_ids.append(outputs[0].outputs[0].token_ids)
+            assert len(token_ids[-1]) == 4
+        assert token_ids[0] == token_ids[1]

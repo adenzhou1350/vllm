@@ -567,6 +567,20 @@ steps:
   commands:
   - PYTHON_ONLY_COMPILE_PYTHON=3.14 bash standalone_tests/python_only_compile.sh
 
+- label: ":nvidia: (L4) PyNvVideoCodec Stream Context"
+  key: pynvvideocodec-stream-context
+  device: l4
+  num_devices: 2
+  timeout_in_minutes: 10
+  source_file_dependencies:
+  - vllm/multimodal/video_decoders/pynvvideocodec.py
+  - tests/multimodal/test_video.py
+  commands:
+  - >-
+    pytest -v -s
+    multimodal/test_video.py::test_pynvvideocodec_stream_context_restores_device
+    multimodal/test_video.py::test_pynvvideocodec_chat_restores_device
+
 - label: ":nvidia: (H200 MIG 35GB) Async Engine, Inputs, Utils, Worker"
   device: h200_35gb
   key: async-engine-inputs-utils-worker

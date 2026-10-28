@@ -931,6 +931,10 @@ preprocessing. For workloads with large videos and relatively light inference,
 such as video tagging, this can alleviate bottlenecks in CPU-based video
 decoders.
 
+Decoding uses CUDA device 0 in the API server process. Its PyTorch stream
+contexts restore the calling thread's previous CUDA device and stream when
+they exit, including on exceptions.
+
 !!! warning
     [CUDA Multi-Process Service (MPS)](https://docs.nvidia.com/deploy/mps/quick-start.html)
     is required when using this backend. Video decoding runs in the API server
