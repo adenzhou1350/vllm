@@ -576,10 +576,22 @@ steps:
   - vllm/multimodal/video_decoders/pynvvideocodec.py
   - tests/multimodal/test_video.py
   commands:
-  - >-
-    pytest -v -s
-    multimodal/test_video.py::test_pynvvideocodec_stream_context_restores_device
-    multimodal/test_video.py::test_pynvvideocodec_chat_restores_device
+  - |
+    set -euo pipefail
+    pynv_devices="$(
+      uv run --no-project --offline --python "$(command -v python)" python -c \
+        'import torch; assert torch.cuda.device_count() >= 2; print(",".join("GPU-" + str(torch.cuda.get_device_properties(i).uuid).removeprefix("GPU-") for i in range(2)))'
+    )"
+    export CUDA_VISIBLE_DEVICES="$pynv_devices"
+    pynv_mps_root="$(mktemp -d /tmp/vllm-pynv-mps.XXXXXX)"
+    export CUDA_MPS_PIPE_DIRECTORY="$pynv_mps_root"
+    export CUDA_MPS_LOG_DIRECTORY="$pynv_mps_root/log"
+    mkdir "$CUDA_MPS_LOG_DIRECTORY"
+    trap 'printf "quit\n" | nvidia-cuda-mps-control' EXIT
+    nvidia-cuda-mps-control -d
+    pytest -v -s \
+      multimodal/test_video.py::test_pynvvideocodec_stream_context_restores_device \
+      multimodal/test_video.py::test_pynvvideocodec_chat_restores_device
 
 - label: ":nvidia: (H200 MIG 35GB) Async Engine, Inputs, Utils, Worker"
   device: h200_35gb
