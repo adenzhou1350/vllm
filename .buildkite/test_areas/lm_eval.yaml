@@ -919,7 +919,9 @@ steps:
   - vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py
   - vllm/model_executor/layers/fused_moe/oracle/
   - vllm/model_executor/kernels/linear/
+  - tests/quantization/test_compressed_tensors.py
   commands:
+  - pytest -v -s quantization/test_compressed_tensors.py::test_compressed_tensors_humming_per_tensor_logprobs
   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=evals/gsm8k/configs/humming/config.txt
 
 - label: ":nvidia: (B200) [Nightly] LM Eval Humming Activation FP8/INT8 TEMPORARY"

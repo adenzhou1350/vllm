@@ -40,6 +40,12 @@ layers use CUTLASS. Per-quantization overrides take precedence over
 `--linear-backend`; schemes without an override continue to use the global
 setting, including automatic selection when it is `auto`.
 
+For INT8 compressed-tensors checkpoints, `--linear-backend humming` selects
+Humming's weight-only INT8 path with floating-point activations (W8A16).
+vLLM preserves the checkpoint's per-tensor or per-channel weight-scale
+granularity automatically; no manual scale reshaping is needed. This does not
+enable INT8 activation kernels (W8A8) on hardware that lacks their support.
+
 ## Supported Hardware
 
 The table below shows the compatibility of various quantization implementations with different hardware platforms in vLLM:

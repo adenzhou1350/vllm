@@ -305,6 +305,34 @@ def test_compressed_tensors_w8a8_dynamic_per_token(
     assert qkv_proj.weight.dtype is torch.int8
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Humming requires CUDA")
+def test_compressed_tensors_humming_per_tensor_logprobs(hf_runner, vllm_runner):
+    """Load real tensor-scale INT8 weights, including fused QKV/gate-up layers."""
+    model_path = "nm-testing/tinyllama-oneshot-w8a8-dynamic-token-v2"
+    prompts = ["The capital of France is", "One plus one equals"]
+    with hf_runner(model_path, dtype="bfloat16") as hf_model:
+        hf_outputs = hf_model.generate_greedy_logprobs_limit(prompts, 4, 10)
+
+    with vllm_runner(
+        model_path,
+        dtype="bfloat16",
+        enforce_eager=True,
+        kernel_config=KernelConfig(linear_backend="humming"),
+        max_model_len=128,
+        max_num_seqs=2,
+        gpu_memory_utilization=0.2,
+        kv_cache_memory_bytes=64 << 20,
+    ) as vllm_model:
+        vllm_outputs = vllm_model.generate_greedy_logprobs(prompts, 4, 10)
+
+    check_logprobs_close(
+        outputs_0_lst=hf_outputs,
+        outputs_1_lst=vllm_outputs,
+        name_0="hf",
+        name_1="humming",
+    )
+
+
 @pytest.mark.parametrize(
     "wNa16_args",
     [

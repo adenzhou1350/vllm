@@ -142,7 +142,11 @@ class HummingInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight_name, weight_scale_name, *_ = self.layer_param_names
         name_map = {"weight": weight_name, "weight_scale": weight_scale_name}
-        quant_config = {"quant_method": "humming", "dtype": "int8"}
+        quant_config = {
+            "quant_method": "humming",
+            "dtype": "int8",
+            "weight_scale_type": "channel" if self.config.is_channelwise else "tensor",
+        }
         weight = getattr(layer, weight_name)
         weight.data = weight.data + 128
 
