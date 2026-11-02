@@ -9,8 +9,10 @@ Please visit the HF collection of [quantized INT8 checkpoints of popular LLMs re
     INT8 computation is supported on NVIDIA GPUs with compute capability > 7.5 (Turing, Ampere, Ada Lovelace, Hopper).
 
 !!! warning
-    **Blackwell GPU Limitation**: INT8 is not supported on compute capability >= 10.0 (e.g., RTX 6000 Blackwell).
+    **Blackwell GPU Limitation**: W8A8 (INT8 weights and activations) is not supported on compute capability >= 10.0 (e.g., RTX 6000 Blackwell).
     Use [FP8 quantization](fp8.md) instead, or run on Hopper/Ada/Ampere architectures.
+    For weight-only INT8 with floating-point activations, see
+    [Humming's W8A16 path](../README.md#selecting-linear-backends-per-quantization).
 
 ## Prerequisites
 

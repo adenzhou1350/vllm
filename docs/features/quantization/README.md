@@ -45,6 +45,9 @@ Humming's weight-only INT8 path with floating-point activations (W8A16).
 vLLM preserves the checkpoint's per-tensor or per-channel weight-scale
 granularity automatically; no manual scale reshaping is needed. This does not
 enable INT8 activation kernels (W8A8) on hardware that lacks their support.
+The default `--linear-backend auto` still selects a backend based on the
+model and hardware; use `--linear-backend humming` to request this path
+explicitly.
 
 ## Supported Hardware
 
