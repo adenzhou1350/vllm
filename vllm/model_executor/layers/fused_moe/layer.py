@@ -382,6 +382,7 @@ def FusedMoEFactory(
         activation=moe_activation,
         device=vllm_config.device_config.device,
         routing_method=router.kernel_routing_method_type,
+        apply_router_weight_on_input=apply_router_weight_on_input,
         has_hash_routing=hash_indices_table is not None,
         require_decomposed_backend=(
             expert_substitution is not None or not router.supports_monolithic_kernels

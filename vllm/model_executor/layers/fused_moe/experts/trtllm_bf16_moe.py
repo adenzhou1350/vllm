@@ -60,8 +60,12 @@ class TrtLlmBf16ExpertsBase:
             activation_key,
             activation_format,
         )
-        if not supported or moe_config.num_experts <= 2048:
+        if not supported:
             return supported, reason
+        if cls.is_monolithic() and moe_config.apply_router_weight_on_input:
+            return False, "FlashInfer BF16 monolithic kernels weight expert outputs"
+        if moe_config.num_experts <= 2048:
+            return True, None
         return False, (
             "FlashInfer TRTLLM routing supports at most 2048 experts, "
             f"but got {moe_config.num_experts}"
@@ -139,8 +143,7 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
         return (
-            moe_parallel_config.use_all2all_kernels
-            and not moe_parallel_config.use_ag_rs_all2all_kernels
+            not moe_parallel_config.use_ag_rs_all2all_kernels
             and not moe_parallel_config.use_deepep_ht_kernels
             and not moe_parallel_config.enable_eplb
         )

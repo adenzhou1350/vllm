@@ -18,6 +18,8 @@ Certain models require the topk weights to be applied to the input activations r
 
 Modular experts must also honor `apply_router_weight_on_input`: after prepare scales the inputs, the experts must not multiply their output by the routing weights again. The TRTLLM BF16 modular wrapper passes unit weights to its fused output finalization in this mode.
 
+For unquantized BF16 with `--moe-backend flashinfer_trtllm`, models such as Llama4 that apply router weights to expert inputs require routed modular experts; the monolithic API only weights outputs. The routed kernel also supports deployments without all2all. Existing modular parallel-mode restrictions still apply, including the exclusions for allgather/reducescatter, DeepEP high throughput, and EPLB. Callers that weight expert outputs can continue to use monolithic experts.
+
 Unless otherwise specified, backends are controlled via the `--all2all-backend` command-line argument (or the `all2all_backend` parameter in `ParallelConfig`). All backends except `flashinfer` only work with EP+DP or EP+TP. `Flashinfer` can work with EP or DP without EP.
 
 <style>
